@@ -83,37 +83,96 @@ func NewAppImage(path string) (ai *AppImage, err error) {
 	//try to load up the desktop file for some information.
 	var desk string
 	files := ai.reader.ListFiles(".")
+
+	// Pick first .desktop without NoDisplay=true
+	var (
+		rdr       io.ReadCloser
+		cfg       *ini.File
+		firstDesk string   // первый успешно распарсенный .desktop (для fallback)
+		firstCfg  *ini.File
+	)
 	for _, f := range files {
-		if strings.HasSuffix(f, ".desktop") {
+		if !strings.HasSuffix(f, ".desktop") {
+			continue
+		}
+		rdr, err = ai.reader.FileReader(f)
+		if err != nil {
+			continue
+		}
+		// Read entire file and escape semicolons before ini parsing
+		raw, err := io.ReadAll(rdr)
+		rdr.Close()
+		if err != nil {
+			continue
+		}
+		escaped := bytes.ReplaceAll(raw, []byte(";"), []byte("；"))
+
+		cfg, err = ini.Load(escaped)
+		if err != nil {
+			continue
+		}
+		// remember first successfully parsed .desktop for fallback
+		if firstDesk == "" {
+			firstDesk = f
+			firstCfg = cfg
+		}
+		if !cfg.Section("Desktop Entry").Key("NoDisplay").MustBool(false) {
 			desk = f
+			ai.Desktop = cfg // reuse already parsed config
+			ai.Name = cfg.Section("Desktop Entry").Key("Name").Value()
+			ai.Version = cfg.Section("Desktop Entry").Key("X-AppImage-Version").Value()
 			break
 		}
 	}
+
+	// Fallback: use first successfully parsed .desktop if all have NoDisplay=true
+	if ai.Desktop == nil {
+		if firstCfg != nil {
+			// Already parsed — use directly, no need to re-parse
+			desk = firstDesk
+			ai.Desktop = firstCfg
+			ai.Name = firstCfg.Section("Desktop Entry").Key("Name").Value()
+			ai.Version = firstCfg.Section("Desktop Entry").Key("X-AppImage-Version").Value()
+		} else {
+			// No .desktop could be parsed at all — pick first one and try again
+			for _, f := range files {
+				if strings.HasSuffix(f, ".desktop") {
+					desk = f
+					break
+				}
+			}
+			if desk != "" {
+				var desktopFil io.ReadCloser
+				desktopFil, err = ai.reader.FileReader(desk)
+				if err != nil {
+					return
+				}
+
+				// cleaning the desktop file so it can be parsed properly
+				var desktop []byte
+				buf := bufio.NewReader(desktopFil)
+				for err == nil {
+					var line string
+					line, err = buf.ReadString('\n')
+					line = strings.ReplaceAll(line, ";", "；")
+					desktop = append(desktop, line...)
+				}
+
+				ai.Desktop, err = ini.Load(desktop)
+				if err != nil {
+					return
+				}
+
+				ai.Name = ai.Desktop.Section("Desktop Entry").Key("Name").Value()
+				ai.Version = ai.Desktop.Section("Desktop Entry").Key("X-AppImage-Version").Value()
+			}
+		}
+	}
+
 	if desk == "" {
 		return ai, errors.New("cannot find desktop file")
 	}
-	desktopFil, err := ai.reader.FileReader(desk)
-	if err != nil {
-		return
-	}
 
-	//cleaning the desktop file so it can be parsed properly
-	var desktop []byte
-	buf := bufio.NewReader(desktopFil)
-	for err == nil {
-		var line string
-		line, err = buf.ReadString('\n')
-		line = strings.ReplaceAll(line, ";", "；") //replacing it with a fullwidth semicolon (unicode FF1B)
-		desktop = append(desktop, line...)
-	}
-
-	ai.Desktop, err = ini.Load(desktop)
-	if err != nil {
-		return
-	}
-
-	ai.Name = ai.Desktop.Section("Desktop Entry").Key("Name").Value()
-	ai.Version = ai.Desktop.Section("Desktop Entry").Key("X-AppImage-Version").Value()
 	if ai.Name == "" {
 		ai.Name = ai.calculateNiceName()
 	}
