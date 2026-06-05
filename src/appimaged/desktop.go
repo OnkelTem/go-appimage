@@ -9,6 +9,7 @@ import (
 	"log"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"time"
 
@@ -17,6 +18,115 @@ import (
 	"github.com/probonopd/go-appimage/internal/helpers"
 	"gopkg.in/ini.v1"
 )
+
+// tokenizeExec splits an Exec line into tokens, respecting single and double quotes.
+// Example: `env FOO="bar baz" myapp %F` → ["env", "FOO=bar baz", "myapp", "%F"]
+func tokenizeExec(s string) []string {
+	var tokens []string
+	i := 0
+	for i < len(s) {
+		for i < len(s) && s[i] == ' ' {
+			i++
+		}
+		if i >= len(s) {
+			break
+		}
+		if s[i] == '"' || s[i] == '\'' {
+			quote := s[i]
+			i++
+			start := i
+			for i < len(s) && s[i] != quote {
+				i++
+			}
+			tokens = append(tokens, s[start:i])
+			if i < len(s) {
+				i++
+			}
+		} else {
+			start := i
+			for i < len(s) && s[i] != ' ' {
+				i++
+			}
+			tokens = append(tokens, s[start:i])
+		}
+	}
+	return tokens
+}
+
+var envVarRe = regexp.MustCompile(`^[a-zA-Z_][a-zA-Z0-9_]*=`)
+
+func looksLikeEnvVar(token string) bool {
+	return envVarRe.MatchString(token)
+}
+
+// joinTokens joins tokens with a space, re-quoting any that contain spaces.
+func joinTokens(tokens []string) string {
+	var b strings.Builder
+	for i, t := range tokens {
+		if i > 0 {
+			b.WriteByte(' ')
+		}
+		if strings.ContainsAny(t, " \t") {
+			b.WriteByte('"')
+			b.WriteString(t)
+			b.WriteByte('"')
+		} else {
+			b.WriteString(t)
+		}
+	}
+	return b.String()
+}
+
+// buildExecString constructs the Exec line for the generated .desktop file.
+// It preserves env prefix and VAR=VAL variables from the original Exec,
+// replaces the program name with "appimaged wrap <AppImage path>",
+// and keeps remaining arguments (%F, -u %u, etc.).
+//
+// Examples:
+//
+//	Input:  "env GDK_BACKEND=x11 UBUNTU_MENUPROXY=0 audacity %F"
+//	Output: "env GDK_BACKEND=x11 UBUNTU_MENUPROXY=0 /path/appimaged wrap \"/path/to/AppImage\" %F"
+//
+//	Input:  "audacity -u %u"
+//	Output: "/path/appimaged wrap \"/path/to/AppImage\" -u %u"
+func buildExecString(origExec, appimagedPath, appImagePath string) string {
+	if origExec == "" {
+		return `"` + appimagedPath + `" wrap "` + appImagePath + `"`
+	}
+
+	tokens := tokenizeExec(origExec)
+	idx := 0
+
+	// (1) Collect "env" prefix if present, plus all VAR=VAL tokens
+	var envPrefix string
+	if tokens[idx] == "env" {
+		envPrefix = "env"
+		idx++
+	}
+	for idx < len(tokens) && looksLikeEnvVar(tokens[idx]) {
+		envPrefix += " " + tokens[idx]
+		idx++
+	}
+	if envPrefix != "" {
+		envPrefix += " "
+	}
+
+	// (2) Guard: no program name found
+	if idx >= len(tokens) {
+		return envPrefix + `"` + appimagedPath + `" wrap "` + appImagePath + `"`
+	}
+
+	// Skip the program name
+	idx++
+
+	// (3) Collect remaining arguments
+	var args string
+	if idx < len(tokens) {
+		args = " " + joinTokens(tokens[idx:])
+	}
+
+	return envPrefix + `"` + appimagedPath + `" wrap "` + appImagePath + `"` + args
+}
 
 // Write desktop file for a given AppImage to a temporary location.
 // Call this with "go" because we have intentional delay in here (we are waiting for
@@ -56,12 +166,10 @@ func writeDesktopFile(ai AppImage) error {
 	// so that renaming the file in the file manager results in a changed name in the menu
 	// FIXME: If the thumbnail is not generated here but by another external thumbnailer, it may not be fast enough
 	time.Sleep(1 * time.Second)
-	add := ""
-	args, err := ai.Args()
-	if err == nil && len(args) > 0 {
-		add = " " + strings.Join(args, " ")
-	}
-	cfg.Section("Desktop Entry").Key("Exec").SetValue(arg0abs + " wrap \"" + ai.Path + "\"" + add) // Resolve to a full path
+	origExec := cfg.Section("Desktop Entry").Key("Exec").Value()
+	cfg.Section("Desktop Entry").Key("Exec").SetValue(
+		buildExecString(origExec, arg0abs, ai.Path),
+	)
 	cfg.Section("Desktop Entry").Key(ExecLocationKey).SetValue(ai.Path)
 	cfg.Section("Desktop Entry").Key("TryExec").SetValue(arg0abs) // Resolve to a full path
 	// For icons, use absolute paths. This way icons start working
@@ -99,15 +207,9 @@ func writeDesktopFile(ai AppImage) error {
 	}
 	for _, a := range actions {
 		sec := cfg.Section("Desktop Action " + a)
-		exec := sec.Key("Exec").String()
-		if exec != "" {
-			if strings.HasPrefix(exec, "\"") {
-				if strings.Contains(exec[1:], "\"") {
-					exec = exec[1 : strings.Index(exec[1:], "\"")+1]
-				}
-			}
-			spl := strings.Split(exec, " ")
-			sec.Key("Exec").SetValue(arg0abs + " wrap \"" + ai.Path + "\" " + strings.Join(spl[1:], " "))
+		origExec := sec.Key("Exec").String()
+		if origExec != "" {
+			sec.Key("Exec").SetValue(buildExecString(origExec, arg0abs, ai.Path))
 		}
 	}
 
